@@ -141,8 +141,8 @@ never reported.
 
 Two cautions. A refresh is a **refresh token rotation**: the old token dies immediately, so
 rotating repeatedly in a short window can invalidate the login. The tool keeps a 30 minute
-cooldown, takes a per-account lock, and waits two seconds after the credentials change
-before killing the CLI, precisely to avoid that. And the refresh is triggered by starting
+cooldown, takes a per-account lock (fail closed - no lock, no refresh), and waits two
+seconds after the credentials change before killing the CLI, precisely to avoid that. And the refresh is triggered by starting
 `claude -p` with a trivial prompt, which is killed before the model answers; it normally
 costs no meaningful usage, but it is not literally zero work.
 
@@ -153,8 +153,10 @@ costs no meaningful usage, but it is not literally zero work.
   `Claude Code-credentials`, with the first 8 hex characters of the sha256 of the config
   directory's absolute path appended for non-default directories. The tool reads it through
   `security find-generic-password`, which may prompt for keychain access the first time.
-- **Windows**: `fcntl` does not exist, so the file locks fail open; the process tree is
-  killed with `taskkill /F /T`. The console's default code page is often not UTF-8, so the
+- **Windows**: `fcntl` does not exist, so the locks go through `msvcrt.locking` instead
+  (`claude_file_lock.py` picks the backend). Refresh locking **fails closed** everywhere: if
+  the lock cannot be taken, the refresh does not start, because a concurrent refresh-token
+  rotation can invalidate the login. The process tree is killed with `taskkill /F /T`. The console's default code page is often not UTF-8, so the
   scripts pin UTF-8 on stdout and force `PYTHONIOENCODING=utf-8` on the child process.
   Without that, non-ASCII output from a subprocess decodes as the ANSI code page (cp949 on
   a Korean install, for instance) and the JSON read fails.

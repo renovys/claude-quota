@@ -11,10 +11,6 @@ periodically and only the accounts below the threshold are refreshed ahead of ti
   claude-token-keepalive.py --force         refresh regardless of the threshold
   claude-token-keepalive.py --dry           print time left and intent, refresh nothing
 """
-try:
-    import fcntl  # missing on Windows - without it we proceed unlocked (fail open).
-except ImportError:
-    fcntl = None
 import json
 import os
 import platform
@@ -156,15 +152,29 @@ def main():
     args = ap.parse_args()
 
     # --dry has no side effects, so it does not take the global lock.
+    # The lock itself fails CLOSED: this script rotates refresh tokens, and two concurrent
+    # rotations invalidate one of them (401, then the account is logged out). The previous
+    # version ran unlocked wherever fcntl was unavailable (Windows).
     if not dry_mode:
         os.makedirs(CACHE_DIR, exist_ok=True)
-        lock = open(LOCK_PATH, "w")
-        if fcntl is not None:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                print("another run is in progress, skipping")
-                return 0
+        try:
+            import claude_file_lock
+        except ImportError:
+            print("no file lock module (claude_file_lock); refusing to refresh")
+            return 1
+        try:
+            lock = open(LOCK_PATH, "w")
+        except OSError as e:
+            print(f"cannot open the lock file, refusing to refresh: {e}")
+            return 1
+        try:
+            got = claude_file_lock.try_lock(lock)
+        except Exception as e:
+            print(f"cannot take the lock, refusing to refresh: {e}")
+            return 1
+        if not got:
+            print("another run is in progress, skipping")
+            return 0
 
     accounts = known_accounts if args.account == "all" else [args.account]
     failed = []  # (account, reason_key, message)

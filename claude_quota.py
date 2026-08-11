@@ -32,17 +32,38 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 
-try:
-    import fcntl  # missing on Windows - without it we proceed unlocked (fail open).
-except ImportError:
-    fcntl = None
-
 # CLI convention: --dry has to be blocked at the top of every function with side effects.
-# It must be known before the parser runs, so sys.argv is inspected directly.
-DRY = "--dry" in sys.argv[1:]
-# Once decided, drop it from argv. Leaving it in makes argparse report the flag after a
-# subcommand as unrecognized and exit 2.
-sys.argv[1:] = [_a for _a in sys.argv[1:] if _a != "--dry"]
+# Importing this module, however, must never read or rewrite the caller's sys.argv. The
+# previous version stripped --dry at import time, so a host CLI importing this library lost
+# its own flag before its parser ever saw it. Only direct execution sets the value below,
+# from main()'s parsed arguments.
+DRY = False
+
+_FILE_LOCK = None
+
+
+def _file_lock_mod():
+    """Return the cross-platform file lock module, or None when it cannot be imported.
+
+    Locking is looked up lazily so that importing this library has no side effects on
+    sys.path. Returning None means "do not refresh": see _acquire_refresh_lock.
+    """
+    global _FILE_LOCK
+    if _FILE_LOCK is not None:
+        return None if _FILE_LOCK is False else _FILE_LOCK
+    for cand in (os.path.dirname(os.path.realpath(__file__)),
+                 os.path.join(os.path.expanduser("~"), ".claude"),
+                 os.path.join(os.path.expanduser("~"), ".local", "bin")):
+        if cand and os.path.isdir(cand) and cand not in sys.path:
+            sys.path.append(cand)
+        try:
+            import claude_file_lock as m
+        except ImportError:
+            continue
+        _FILE_LOCK = m
+        return m
+    _FILE_LOCK = False
+    return None
 
 LOCAL_TZ = datetime.now().astimezone().tzinfo
 OAUTH_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -308,32 +329,51 @@ def _refresh_mark(account):
 
 
 def _acquire_refresh_lock(account):
-    """Non-blocking flock on a per-account lock file. Returns (lock_file, ok, reason).
-    Without fcntl (Windows) it passes through unlocked (fail open)."""
-    if fcntl is None:
-        return None, True, None
+    """Non-blocking exclusive lock on a per-account lock file. Returns (file, ok, reason).
+
+    This fails CLOSED. A missing lock module, an unopenable lock file or a raising lock
+    backend all mean the refresh does not start. Two processes rotating the same
+    refresh token concurrently invalidate one of them, which ends in 401 and the
+    credentials being deleted (the account is logged out). The previous version passed
+    through unlocked wherever fcntl was unavailable (Windows) — exactly that path.
+    """
+    m = _file_lock_mod()
+    if m is None:
+        return None, False, "no file lock module (claude_file_lock); refusing to refresh"
     try:
         os.makedirs(CACHE_DIR, exist_ok=True)
         f = open(_refresh_lock_path(account), "w")
-        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return f, True, None
-    except BlockingIOError:
-        return None, False, "another process is already refreshing"
-    except Exception:
-        return None, True, None  # a broken locking mechanism fails open
-
-
-def _release_refresh_lock(f):
-    if f is None:
-        return
+    except Exception as e:
+        return None, False, f"cannot open the refresh lock file: {e}"
     try:
-        fcntl.flock(f, fcntl.LOCK_UN)
-    except Exception:
-        pass
+        got = m.try_lock(f)
+    except Exception as e:
+        _close_quietly(f)
+        return None, False, f"cannot take the refresh lock: {e}"
+    if not got:
+        _close_quietly(f)
+        return None, False, "another process is already refreshing"
+    return f, True, None
+
+
+def _close_quietly(f):
     try:
         f.close()
     except Exception:
         pass
+
+
+def _release_refresh_lock(f):
+    """Release the lock. POSIX releases on close; Windows needs the explicit unlock."""
+    if f is None:
+        return
+    m = _file_lock_mod()
+    if m is not None:
+        try:
+            m.unlock(f)
+        except Exception:
+            pass
+    _close_quietly(f)
 
 
 def refresh_token(account, timeout=90):
@@ -646,6 +686,7 @@ def summary_line(d):
 
 
 def main():
+    global DRY
     ap = argparse.ArgumentParser(description="Read Claude account usage limits")
     ap.add_argument("--dry", action="store_true",
                       help="only print what would happen, no side effects")
@@ -657,6 +698,7 @@ def main():
     ap.add_argument("--no-refresh", action="store_true",
                       help="never start the CLI to refresh an expired token (query only)")
     a = ap.parse_args()
+    DRY = a.dry   # only direct execution sets this; importing never inspects argv
 
     names = account_names() if a.account in ("all", "both") else [a.account]
     out = {n: quota(n, ttl=a.ttl, force=a.refresh, auto_refresh=not a.no_refresh) for n in names}
